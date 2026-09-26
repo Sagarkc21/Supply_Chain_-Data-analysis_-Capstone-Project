@@ -1,0 +1,459 @@
+/* ================================================================
+   NZ supply chain data generator  (v2 - fixed)
+
+   FIX: v1 used ABS(CHECKSUM(NEWID())) inside JOIN predicates.
+   SQL Server may re-evaluate a non-deterministic expression once per
+   row of the joined table, so a single source row could match several
+   pick-list rows and produce duplicates. All randomness is now
+   materialised into seed temp tables before any join uses it.
+
+   Run as ONE batch. Do not add GO - the DECLAREs and #temp tables
+   must stay in scope to the end.
+   ================================================================ */
+
+SET NOCOUNT ON;
+
+/* ---------------- PARAMETERS ---------------- */
+DECLARE @ProductCount     int = 200;   -- max 240 (30 items x 8 packs)
+DECLARE @InventoryFillPct int = 30;
+DECLARE @POCount          int = 1200;
+DECLARE @SalesCount       int = 1500;
+DECLARE @HistoryDays      int = 540;
+DECLARE @SalesDays        int = 365;
+
+/* ---------------- RESET ----------------
+   v1 committed 8 warehouse rows before failing. Clearing in reverse
+   FK order so warehouse_code does not collide on re-run.          */
+DELETE FROM dbo.sales;
+DELETE FROM dbo.purchase_orders;
+DELETE FROM dbo.inventory;
+DELETE FROM dbo.products;
+DELETE FROM dbo.warehouses;
+DELETE FROM dbo.suppliers;
+
+/* ---------------- PICK LISTS ---------------- */
+DROP TABLE IF EXISTS #Supplier, #Warehouse, #Item, #Pack, #Brand,
+                     #FirstName, #LastName, #Terms, #Status,
+                     #Channel, #Region, #CustPrefix, #CustSuffix,
+                     #SupSeed, #ProdSeed, #ProdRank, #WhRank,
+                     #InvRank, #POSeed, #SalesSeed;
+
+CREATE TABLE #Supplier (id int IDENTITY(1,1), supplier_name nvarchar(80),
+                        region nvarchar(50), country nvarchar(40), category nvarchar(30));
+INSERT INTO #Supplier (supplier_name, region, country, category) VALUES
+ ('Waikato Dairy Collective','Waikato','New Zealand','Dairy'),
+ ('Taupo Creamery Ltd','Waikato','New Zealand','Dairy'),
+ ('Southland Meat Exporters','Southland','New Zealand','Meat'),
+ ('Manawatu Protein Works','Manawatu-Whanganui','New Zealand','Meat'),
+ ('Bay of Plenty Kiwifruit Packers','Bay of Plenty','New Zealand','Produce'),
+ ('Hawke''s Bay Orchards Ltd','Hawke''s Bay','New Zealand','Produce'),
+ ('Nelson Seafood Co-op','Nelson','New Zealand','Seafood'),
+ ('Coromandel Aquaculture','Waikato','New Zealand','Seafood'),
+ ('Marlborough Wine Cellars','Marlborough','New Zealand','Beverage'),
+ ('Central Plateau Springs','Waikato','New Zealand','Beverage'),
+ ('Canterbury Grain Millers','Canterbury','New Zealand','Grain'),
+ ('Taranaki Timber Mills','Taranaki','New Zealand','Timber'),
+ ('Manawatu Packaging Supplies','Manawatu-Whanganui','New Zealand','Packaging'),
+ ('Otago Wool Brokers','Otago','New Zealand','Textile'),
+ ('Wairarapa Olive Press','Wellington','New Zealand','Oils'),
+ ('Riverina Foods Australia','New South Wales','Australia','Grain');
+
+CREATE TABLE #Warehouse (id int IDENTITY(1,1), warehouse_code nvarchar(20),
+                         warehouse_name nvarchar(80), city nvarchar(50),
+                         region nvarchar(50), capacity_units int);
+INSERT INTO #Warehouse (warehouse_code, warehouse_name, city, region, capacity_units) VALUES
+ ('WH-AKL-01','Penrose Distribution Centre','Auckland','Auckland',42000),
+ ('WH-AKL-02','Wiri Coldstore','Auckland','Auckland',28000),
+ ('WH-HLZ-01','Te Rapa Distribution Centre','Hamilton','Waikato',31000),
+ ('WH-TRG-01','Mount Maunganui Port Store','Tauranga','Bay of Plenty',55000),
+ ('WH-WLG-01','Seaview Distribution Centre','Lower Hutt','Wellington',24000),
+ ('WH-CHC-01','Hornby Distribution Centre','Christchurch','Canterbury',38000),
+ ('WH-DUD-01','Southern Store','Dunedin','Otago',16000),
+ ('WH-IVC-01','Invercargill Export Depot','Invercargill','Southland',19000);
+
+CREATE TABLE #Item (id int IDENTITY(1,1), item_name nvarchar(60), category nvarchar(30),
+                    unit_of_measure nvarchar(20), base_cost decimal(12,2));
+INSERT INTO #Item (item_name, category, unit_of_measure, base_cost) VALUES
+ ('Whole milk powder','Dairy','kg',3.10),('Salted butter','Dairy','kg',7.20),
+ ('Cheddar block','Dairy','kg',9.40),
+ ('Frozen lamb rack','Meat','kg',22.60),('Beef mince','Meat','kg',9.80),
+ ('Venison loin','Meat','kg',27.50),
+ ('Green kiwifruit','Produce','kg',2.40),('Braeburn apples','Produce','kg',2.70),
+ ('Hass avocado','Produce','each',4.10),
+ ('Greenshell mussels','Seafood','kg',7.60),('Snapper fillet','Seafood','kg',24.80),
+ ('King salmon fillet','Seafood','kg',29.30),
+ ('Sauvignon blanc','Beverage','bottle',12.90),('Pinot noir','Beverage','bottle',19.40),
+ ('Artesian water','Beverage','L',0.85),
+ ('Wheat flour','Grain','kg',1.95),('Rolled oats','Grain','kg',2.35),
+ ('Malting barley','Grain','kg',1.40),
+ ('Pine framing 100x50','Timber','m',9.80),('Plywood sheet 12mm','Timber','sheet',31.50),
+ ('Decking board','Timber','m',18.60),
+ ('Cardboard carton','Packaging','each',0.78),('Pallet wrap roll','Packaging','roll',17.20),
+ ('Cold chain liner','Packaging','each',4.55),
+ ('Merino wool bale','Textile','bale',168.00),('Crossbred wool bale','Textile','bale',112.00),
+ ('Lanolin drum','Textile','drum',66.00),
+ ('Extra virgin olive oil','Oils','L',15.80),('Avocado oil','Oils','L',12.40),
+ ('Canola oil','Oils','L',4.90);
+
+CREATE TABLE #Pack (id int IDENTITY(1,1), pack_label nvarchar(30), multiplier decimal(8,2));
+INSERT INTO #Pack (pack_label, multiplier) VALUES
+ ('retail unit',1.00),('case of 6',5.70),('case of 12',11.20),('case of 24',22.10),
+ ('half pallet',44.00),('full pallet',86.00),('bulk bag',150.00),('container lot',820.00);
+
+CREATE TABLE #Brand (id int IDENTITY(1,1), brand nvarchar(40));
+INSERT INTO #Brand (brand) VALUES
+ ('Kauri Foods'),('Silver Fern Select'),('Tasman Trade'),('Aotearoa Pure'),
+ ('Southern Cross Provisions'),('Rangitoto Reserve'),('Alpine Harvest'),
+ ('Coastline Co'),('Kea Provisions'),('Fernmark Standard'),('Pounamu Premium'),
+ ('Longwhite Supply');
+
+CREATE TABLE #FirstName (id int IDENTITY(1,1), val nvarchar(30));
+INSERT INTO #FirstName (val) VALUES
+ ('Aroha'),('Ben'),('Cameron'),('Dana'),('Ethan'),('Fiona'),('Grace'),('Hemi'),
+ ('Isla'),('Jared'),('Kiri'),('Liam'),('Manaia'),('Nikau'),('Olivia'),('Priya'),
+ ('Quentin'),('Rangi'),('Sarah'),('Tane'),('Ursula'),('Vikram'),('Wiremu'),('Zoe');
+
+CREATE TABLE #LastName (id int IDENTITY(1,1), val nvarchar(30));
+INSERT INTO #LastName (val) VALUES
+ ('Anderson'),('Brooke'),('Clark'),('Dawson'),('Edwards'),('Fletcher'),('Grant'),
+ ('Harding'),('Ihaka'),('Jamieson'),('Kingi'),('Lawson'),('Mitchell'),('Ngata'),
+ ('Oliver'),('Patel'),('Reeves'),('Stewart'),('Tipene'),('Wallace'),('Young');
+
+CREATE TABLE #Terms (id int IDENTITY(1,1), val nvarchar(30));
+INSERT INTO #Terms (val) VALUES
+ ('Net 7'),('Net 14'),('Net 30'),('Net 30'),('Net 45'),('Net 60'),('2/10 Net 30');
+
+CREATE TABLE #Status (id int IDENTITY(1,1), val nvarchar(30));
+INSERT INTO #Status (val) VALUES
+ ('Received'),('Received'),('Received'),('Received'),('Received'),('Received'),
+ ('In Transit'),('In Transit'),('Approved'),('Pending'),('Cancelled');
+
+CREATE TABLE #Channel (id int IDENTITY(1,1), val nvarchar(30));
+INSERT INTO #Channel (val) VALUES
+ ('Retail'),('Retail'),('Retail'),('Wholesale'),('Wholesale'),('Online'),('Online'),('Export');
+
+CREATE TABLE #Region (id int IDENTITY(1,1), val nvarchar(50));
+INSERT INTO #Region (val) VALUES
+ ('Auckland'),('Auckland'),('Auckland'),('Waikato'),('Bay of Plenty'),('Wellington'),
+ ('Wellington'),('Canterbury'),('Canterbury'),('Otago'),('Southland'),
+ ('Manawatu-Whanganui'),('Hawke''s Bay'),('Taranaki'),('Northland'),('Nelson'),
+ ('Marlborough'),('West Coast');
+
+CREATE TABLE #CustPrefix (id int IDENTITY(1,1), val nvarchar(40));
+INSERT INTO #CustPrefix (val) VALUES
+ ('Harbourside'),('Queen Street'),('Riverbank'),('Lakeview'),('Summit'),('Kotare'),
+ ('Northpoint'),('Eastgate'),('Westhaven'),('Clearwater'),('Highfield'),('Stonebridge'),
+ ('Fernway'),('Tussock'),('Mariner'),('Greenline'),('Silverdale'),('Bluffside');
+
+CREATE TABLE #CustSuffix (id int IDENTITY(1,1), val nvarchar(40));
+INSERT INTO #CustSuffix (val) VALUES
+ ('Grocers'),('Food Service'),('Wholesale Ltd'),('Trading Co'),('Markets'),
+ ('Distributors'),('Hospitality Group'),('Cafe Group'),('Supermarket'),
+ ('Export Partners'),('Provisions'),('Retail Group');
+
+DECLARE @nProd int, @nWh int, @nInv int;
+
+BEGIN TRANSACTION;
+
+/* ================= 1. suppliers =================
+   Seed table first: every random value is written to disk once, so
+   nothing can be re-evaluated during the insert.                   */
+CREATE TABLE #SupSeed (
+    id int, supplier_name nvarchar(80), region nvarchar(50),
+    country nvarchar(40), contact_name nvarchar(70),
+    email_local nvarchar(70), payment_terms nvarchar(30),
+    lead_time_days int, reliability_score decimal(5,2), created_at datetime);
+
+INSERT INTO #SupSeed
+SELECT s.id, s.supplier_name, s.region, s.country,
+       fn.val + ' ' + ln.val,
+       LOWER(fn.val) + '.' + LOWER(ln.val),
+       t.val,
+       CASE WHEN s.country = 'Australia' THEN 14 + ABS(CHECKSUM(NEWID())) % 21
+            ELSE 2 + ABS(CHECKSUM(NEWID())) % 12 END,
+       CAST(72.0 + (ABS(CHECKSUM(NEWID())) % 2700) / 100.0 AS decimal(5,2)),
+       DATEADD(day, -(ABS(CHECKSUM(NEWID())) % 1095), GETDATE())
+FROM #Supplier s
+CROSS APPLY (SELECT TOP 1 val FROM #FirstName ORDER BY NEWID()) fn
+CROSS APPLY (SELECT TOP 1 val FROM #LastName  ORDER BY NEWID()) ln
+CROSS APPLY (SELECT TOP 1 val FROM #Terms     ORDER BY NEWID()) t;
+
+INSERT INTO dbo.suppliers
+    (supplier_code, supplier_name, contact_name, email, region, country,
+     payment_terms, lead_time_days, reliability_score, created_at)
+SELECT 'SUP-' + RIGHT('000' + CAST(id AS varchar(4)), 3),
+       supplier_name, contact_name,
+       email_local + '@'
+         + LOWER(REPLACE(REPLACE(REPLACE(supplier_name,'''',''),' ',''),'.','')) + '.co.nz',
+       region, country, payment_terms, lead_time_days, reliability_score, created_at
+FROM #SupSeed;
+
+/* ================= 2. warehouses ================= */
+INSERT INTO dbo.warehouses
+    (warehouse_code, warehouse_name, city, region, country, capacity_units, created_at)
+SELECT warehouse_code, warehouse_name, city, region, 'New Zealand', capacity_units,
+       DATEADD(day, -(ABS(CHECKSUM(NEWID())) % 1825), GETDATE())
+FROM #Warehouse;
+
+/* ================= 3. products ================= */
+CREATE TABLE #ProdSeed (
+    product_name nvarchar(120), category nvarchar(30), brand nvarchar(40),
+    unit_of_measure nvarchar(20), unit_cost decimal(12,2),
+    markup decimal(6,2), demand int, supplier_id int);
+
+INSERT INTO #ProdSeed
+SELECT TOP (@ProductCount)
+       i.item_name + ' - ' + p.pack_label,
+       i.category,
+       b.brand,
+       i.unit_of_measure,
+       CAST(i.base_cost * p.multiplier AS decimal(12,2)),
+       CAST(1.22 + (ABS(CHECKSUM(NEWID())) % 60) / 100.0 AS decimal(6,2)),
+       5 + ABS(CHECKSUM(NEWID())) % 46,
+       sup.supplier_id
+FROM #Item i
+CROSS JOIN #Pack p
+CROSS APPLY (SELECT TOP 1 brand FROM #Brand ORDER BY NEWID()) b
+CROSS APPLY (
+    SELECT TOP 1 s.supplier_id
+    FROM dbo.suppliers s
+    JOIN #Supplier ss ON ss.supplier_name = s.supplier_name
+    WHERE ss.category = i.category
+    ORDER BY NEWID()
+) sup
+ORDER BY p.id, i.id;
+
+INSERT INTO dbo.products
+    (product_name, category, brand, supplier_id, unit_of_measure,
+     unit_cost, unit_price, gross_margin, reorder_point, safety_stock)
+SELECT product_name, category, brand, supplier_id, unit_of_measure,
+       unit_cost,
+       CAST(unit_cost * markup AS decimal(12,2)),
+       CAST((unit_cost * markup - unit_cost) / NULLIF(unit_cost * markup, 0) * 100
+            AS decimal(6,2)),
+       demand * 7,
+       demand * 3
+FROM #ProdSeed;
+
+/* ================= 4. inventory ================= */
+INSERT INTO dbo.inventory
+    (product_id, warehouse_id, quantity_on_hand, quantity_reserved,
+     quantity_available, last_restock_date, last_updated)
+SELECT product_id, warehouse_id, on_hand, reserved,
+       on_hand - reserved,
+       restock,
+       DATEADD(hour, hrs, CAST(restock AS datetime))
+FROM (
+    SELECT p.product_id, w.warehouse_id,
+           o.on_hand,
+           CAST(o.on_hand * ((ABS(CHECKSUM(NEWID())) % 25) / 100.0) AS int) AS reserved,
+           CAST(DATEADD(day, -(ABS(CHECKSUM(NEWID())) % 90), GETDATE()) AS date) AS restock,
+           ABS(CHECKSUM(NEWID())) % 72 AS hrs
+    FROM dbo.products p
+    CROSS JOIN dbo.warehouses w
+    CROSS APPLY (SELECT (ABS(CHECKSUM(NEWID())) % 1400) + 40 AS on_hand) o
+    WHERE (p.product_id * 7 + w.warehouse_id * 13) % 100 < @InventoryFillPct
+) src;
+
+/* ---- rank tables: stable row numbers for the seed joins ---- */
+CREATE TABLE #ProdRank (rn int PRIMARY KEY, product_id int, supplier_id int,
+                        unit_cost decimal(12,2), unit_price decimal(12,2),
+                        lead_time_days int);
+INSERT INTO #ProdRank
+SELECT ROW_NUMBER() OVER (ORDER BY pr.product_id) - 1,
+       pr.product_id, pr.supplier_id, pr.unit_cost, pr.unit_price, s.lead_time_days
+FROM dbo.products pr
+JOIN dbo.suppliers s ON s.supplier_id = pr.supplier_id;
+
+CREATE TABLE #WhRank (rn int PRIMARY KEY, warehouse_id int);
+INSERT INTO #WhRank
+SELECT ROW_NUMBER() OVER (ORDER BY warehouse_id) - 1, warehouse_id
+FROM dbo.warehouses;
+
+CREATE TABLE #InvRank (rn int PRIMARY KEY, product_id int, warehouse_id int,
+                       unit_price decimal(12,2));
+INSERT INTO #InvRank
+SELECT ROW_NUMBER() OVER (ORDER BY i.product_id, i.warehouse_id) - 1,
+       i.product_id, i.warehouse_id, p.unit_price
+FROM dbo.inventory i
+JOIN dbo.products p ON p.product_id = i.product_id;
+
+SET @nProd = (SELECT COUNT(*) FROM #ProdRank);
+SET @nWh   = (SELECT COUNT(*) FROM #WhRank);
+SET @nInv  = (SELECT COUNT(*) FROM #InvRank);
+
+/* ================= 5. purchase_orders ================= */
+CREATE TABLE #POSeed (
+    i int, prod_rn int, wh_rn int, status_val nvarchar(30),
+    quantity int, jitter int, days_back int, recv_offset int);
+
+INSERT INTO #POSeed
+SELECT TOP (@POCount)
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
+       ABS(CHECKSUM(NEWID())) % @nProd,
+       ABS(CHECKSUM(NEWID())) % @nWh,
+       st.val,
+       ((ABS(CHECKSUM(NEWID())) % 40) + 1) * 25,
+       ABS(CHECKSUM(NEWID())) % 11,
+       ABS(CHECKSUM(NEWID())) % @HistoryDays,
+       (ABS(CHECKSUM(NEWID())) % 9) - 3
+FROM sys.all_objects a
+CROSS JOIN sys.all_objects b
+CROSS APPLY (SELECT TOP 1 val FROM #Status ORDER BY NEWID()) st;
+
+INSERT INTO dbo.purchase_orders
+    (po_number, supplier_id, product_id, warehouse_id, quantity, unit_cost,
+     total_cost, order_date, expected_delivery_date, actual_delivery_date, status)
+SELECT
+    'PO-' + CONVERT(char(6), d.order_date, 112) + '-'
+          + RIGHT('00000' + CAST(s.i AS varchar(6)), 5),
+    p.supplier_id, p.product_id, w.warehouse_id, s.quantity,
+    c.unit_cost,
+    CAST(s.quantity * c.unit_cost AS decimal(14,2)),
+    d.order_date,
+    d.expected,
+    CASE WHEN s.status_val = 'Received' THEN DATEADD(day, s.recv_offset, d.expected) END,
+    s.status_val
+FROM #POSeed s
+JOIN #ProdRank p ON p.rn = s.prod_rn
+JOIN #WhRank   w ON w.rn = s.wh_rn
+CROSS APPLY (SELECT CAST(DATEADD(day, -s.days_back, GETDATE()) AS date) AS order_date) od
+CROSS APPLY (SELECT od.order_date,
+                    DATEADD(day, p.lead_time_days, od.order_date) AS expected) d
+CROSS APPLY (SELECT CAST(p.unit_cost * (0.95 + s.jitter / 100.0) AS decimal(12,2))
+                    AS unit_cost) c;
+
+/* ================= 6. sales ================= */
+CREATE TABLE #SalesSeed (
+    i int, inv_rn int, channel nvarchar(30), cust_region nvarchar(50),
+    customer_name nvarchar(90), r_qty int, r_disc int, days_back int);
+
+INSERT INTO #SalesSeed
+SELECT TOP (@SalesCount)
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
+       ABS(CHECKSUM(NEWID())) % @nInv,
+       ch.val,
+       rg.val,
+       cp.val + ' ' + cs.val,
+       ABS(CHECKSUM(NEWID())),
+       ABS(CHECKSUM(NEWID())),
+       ABS(CHECKSUM(NEWID())) % @SalesDays
+FROM sys.all_objects a
+CROSS JOIN sys.all_objects b
+CROSS APPLY (SELECT TOP 1 val FROM #Channel    ORDER BY NEWID()) ch
+CROSS APPLY (SELECT TOP 1 val FROM #Region     ORDER BY NEWID()) rg
+CROSS APPLY (SELECT TOP 1 val FROM #CustPrefix ORDER BY NEWID()) cp
+CROSS APPLY (SELECT TOP 1 val FROM #CustSuffix ORDER BY NEWID()) cs;
+
+INSERT INTO dbo.sales
+    (order_number, product_id, warehouse_id, customer_name, customer_region,
+     sales_channel, quantity, unit_price, discount_pct, total_amount, sale_date)
+SELECT
+    'SO-' + CONVERT(char(6), d.sale_date, 112) + '-'
+          + RIGHT('00000' + CAST(s.i AS varchar(6)), 5),
+    v.product_id, v.warehouse_id, s.customer_name, s.cust_region, s.channel,
+    q.quantity,
+    pr.unit_price,
+    dc.discount_pct,
+    CAST(q.quantity * pr.unit_price * (1 - dc.discount_pct / 100.0) AS decimal(14,2)),
+    d.sale_date
+FROM #SalesSeed s
+JOIN #InvRank v ON v.rn = s.inv_rn
+CROSS APPLY (SELECT CAST(DATEADD(day, -s.days_back, GETDATE()) AS date) AS sale_date) d
+CROSS APPLY (SELECT CASE s.channel
+                      WHEN 'Wholesale' THEN ((s.r_qty % 30) + 4) * 10
+                      WHEN 'Export'    THEN ((s.r_qty % 40) + 10) * 20
+                      WHEN 'Online'    THEN (s.r_qty % 12) + 1
+                      ELSE (s.r_qty % 30) + 1
+                    END AS quantity) q
+CROSS APPLY (SELECT CAST(v.unit_price *
+                      CASE s.channel WHEN 'Wholesale' THEN 0.86
+                                     WHEN 'Export'    THEN 0.79
+                                     WHEN 'Online'    THEN 1.04
+                                     ELSE 1.00 END AS decimal(12,2)) AS unit_price) pr
+CROSS APPLY (SELECT CAST(CASE WHEN s.r_disc % 100 < 55 THEN 0
+                              ELSE s.r_disc % 16 END AS decimal(5,2))
+                    AS discount_pct) dc;
+
+COMMIT;
+
+DROP TABLE IF EXISTS #Supplier, #Warehouse, #Item, #Pack, #Brand,
+                     #FirstName, #LastName, #Terms, #Status,
+                     #Channel, #Region, #CustPrefix, #CustSuffix,
+                     #SupSeed, #ProdSeed, #ProdRank, #WhRank,
+                     #InvRank, #POSeed, #SalesSeed;
+
+/* ================= VERIFICATION ================= */
+SELECT 'suppliers' AS table_name, COUNT(*) AS row_count FROM dbo.suppliers
+UNION ALL SELECT 'warehouses',      COUNT(*) FROM dbo.warehouses
+UNION ALL SELECT 'products',        COUNT(*) FROM dbo.products
+UNION ALL SELECT 'inventory',       COUNT(*) FROM dbo.inventory
+UNION ALL SELECT 'purchase_orders', COUNT(*) FROM dbo.purchase_orders
+UNION ALL SELECT 'sales',           COUNT(*) FROM dbo.sales;
+
+/* duplicate-key check - the v1 failure mode */
+SELECT 'duplicate supplier_code' AS check_name, COUNT(*) AS failures
+FROM (SELECT supplier_code FROM dbo.suppliers
+      GROUP BY supplier_code HAVING COUNT(*) > 1) d
+UNION ALL
+SELECT 'duplicate po_number', COUNT(*)
+FROM (SELECT po_number FROM dbo.purchase_orders
+      GROUP BY po_number HAVING COUNT(*) > 1) d
+UNION ALL
+SELECT 'duplicate order_number', COUNT(*)
+FROM (SELECT order_number FROM dbo.sales
+      GROUP BY order_number HAVING COUNT(*) > 1) d
+UNION ALL
+SELECT 'duplicate inventory pair', COUNT(*)
+FROM (SELECT product_id, warehouse_id FROM dbo.inventory
+      GROUP BY product_id, warehouse_id HAVING COUNT(*) > 1) d;
+
+/* business logic checks - all must return 0 */
+SELECT 'negative available stock' AS check_name, COUNT(*) AS failures
+FROM dbo.inventory WHERE quantity_available < 0
+UNION ALL SELECT 'reserved exceeds on hand', COUNT(*)
+FROM dbo.inventory WHERE quantity_reserved > quantity_on_hand
+UNION ALL SELECT 'price below cost', COUNT(*)
+FROM dbo.products WHERE unit_price <= unit_cost
+UNION ALL SELECT 'delivery before order', COUNT(*)
+FROM dbo.purchase_orders WHERE expected_delivery_date < order_date
+UNION ALL SELECT 'actual delivery on open PO', COUNT(*)
+FROM dbo.purchase_orders
+WHERE status IN ('Pending','Approved','Cancelled') AND actual_delivery_date IS NOT NULL
+UNION ALL SELECT 'received PO with no delivery date', COUNT(*)
+FROM dbo.purchase_orders WHERE status = 'Received' AND actual_delivery_date IS NULL
+UNION ALL SELECT 'total_cost mismatch', COUNT(*)
+FROM dbo.purchase_orders WHERE ABS(total_cost - quantity * unit_cost) > 0.01
+UNION ALL SELECT 'total_amount mismatch', COUNT(*)
+FROM dbo.sales
+WHERE ABS(total_amount - quantity * unit_price * (1 - discount_pct / 100.0)) > 0.05
+UNION ALL SELECT 'sale from unstocked warehouse', COUNT(*)
+FROM dbo.sales s
+WHERE NOT EXISTS (SELECT 1 FROM dbo.inventory i
+                  WHERE i.product_id = s.product_id AND i.warehouse_id = s.warehouse_id);
+
+/* orphan check - all must return 0 */
+SELECT 'products -> suppliers' AS relationship, COUNT(*) AS orphans
+FROM dbo.products c LEFT JOIN dbo.suppliers p ON p.supplier_id = c.supplier_id
+WHERE c.supplier_id IS NOT NULL AND p.supplier_id IS NULL
+UNION ALL SELECT 'inventory -> products', COUNT(*)
+FROM dbo.inventory c LEFT JOIN dbo.products p ON p.product_id = c.product_id
+WHERE p.product_id IS NULL
+UNION ALL SELECT 'inventory -> warehouses', COUNT(*)
+FROM dbo.inventory c LEFT JOIN dbo.warehouses w ON w.warehouse_id = c.warehouse_id
+WHERE w.warehouse_id IS NULL
+UNION ALL SELECT 'purchase_orders -> products', COUNT(*)
+FROM dbo.purchase_orders c LEFT JOIN dbo.products p ON p.product_id = c.product_id
+WHERE p.product_id IS NULL
+UNION ALL SELECT 'purchase_orders -> suppliers', COUNT(*)
+FROM dbo.purchase_orders c LEFT JOIN dbo.suppliers s ON s.supplier_id = c.supplier_id
+WHERE s.supplier_id IS NULL
+UNION ALL SELECT 'purchase_orders -> warehouses', COUNT(*)
+FROM dbo.purchase_orders c LEFT JOIN dbo.warehouses w ON w.warehouse_id = c.warehouse_id
+WHERE w.warehouse_id IS NULL
+UNION ALL SELECT 'sales -> products', COUNT(*)
+FROM dbo.sales c LEFT JOIN dbo.products p ON p.product_id = c.product_id
+WHERE p.product_id IS NULL
+UNION ALL SELECT 'sales -> warehouses', COUNT(*)
+FROM dbo.sales c LEFT JOIN dbo.warehouses w ON w.warehouse_id = c.warehouse_id
+WHERE w.warehouse_id IS NULL;
